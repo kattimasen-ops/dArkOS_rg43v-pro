@@ -1,24 +1,23 @@
-name: Extract & Decompile RG43V-Pro DTB[cite: 14]
+name: Extract & Decompile RG43V-Pro DTB
 
 on:
   workflow_dispatch:
     inputs:
       file_id:
-        description: "Google Drive File-ID der EmuELEC-Firmware (Override, optional)"[cite: 14]
+        description: "Google Drive File-ID der EmuELEC-Firmware (Override, optional)"
         required: false
-        default: "1h7hc3wwdCgFMogr7Fi-W8EeQwp279Ipm"[cite: 14]
+        default: "1h7hc3wwdCgFMogr7Fi-W8EeQwp279Ipm"
 
 permissions:
-  contents: write   # noetig, damit der Commit/Push-Schritt am Ende mit dem
-                     # eingebauten GITHUB_TOKEN ins Repo schreiben darf[cite: 14]
+  contents: write
 
 jobs:
   extract-and-decompile:
-    runs-on: ubuntu-latest[cite: 14]
+    runs-on: ubuntu-latest
 
     steps:
       - name: Repository auschecken
-        uses: actions/checkout@v4[cite: 14]
+        uses: actions/checkout@v4
 
       - name: System-Abhängigkeiten installieren
         run: |
@@ -27,11 +26,11 @@ jobs:
           sudo apt-get install -y wget curl p7zip-full p7zip-rar xz-utils util-linux \
             device-tree-compiler python3-pip fdisk kpartx
           pip3 install --upgrade pip --break-system-packages
-          pip3 install gdown requests --break-system-packages[cite: 14]
+          pip3 install gdown requests --break-system-packages
 
       - name: Firmware von Google Drive herunterladen (robuster Download mit Retry)
         env:
-          FILE_ID: ${{ inputs.file_id }}[cite: 14]
+          FILE_ID: ${{ inputs.file_id }}
         run: |
           echo "Lade EmuELEC Firmware für RG43V-Pro herunter (File-ID: $FILE_ID)..."
           rm -f firmware_archive
@@ -73,7 +72,7 @@ jobs:
 
           echo "Firmware erfolgreich heruntergeladen. Dateigröße:"
           ls -lh firmware_archive
-          file firmware_archive || true[cite: 14]
+          file firmware_archive || true
 
       - name: Image-Datei entpacken
         run: |
@@ -111,138 +110,115 @@ jobs:
             exit 1
           fi
           echo "Image-Größe OK: ${IMG_SIZE} Bytes"
-          echo "IMG_FILE=$IMG_FILE" >> "$GITHUB_ENV"[cite: 14]
+          echo "IMG_FILE=$IMG_FILE" >> "$GITHUB_ENV"
 
-      - name: Erweiterte DTB-Extraktion (Rockchip RKFW Container, Partitionen & Signatur-Scan)
+      - name: Partitionen per Loop-Device einbinden und DTB suchen
         run: |
-          mkdir -p dtb_output extracted_subimages boot_mnt
+          mkdir -p dtb_output boot_mnt
           IMG="${{ env.IMG_FILE }}"
+          echo "Partitionstabelle von: $IMG"
+          fdisk -l "$IMG" || true
 
-          cat > /tmp/extract_rockchip_dtb.py << 'PYEOF'
+          LOOP_DEV=$(sudo losetup -Pf --show "$IMG")
+          echo "Image als $LOOP_DEV eingebunden, warte auf Partitions-Nodes..."
+          sudo partprobe "$LOOP_DEV" 2>/dev/null || true
+          sleep 2
+
+          MOUNTED=false
+          for part in "${LOOP_DEV}"p*; do
+            [ -b "$part" ] || continue
+            echo "Teste Partition $part ..."
+            if sudo mount -o ro "$part" boot_mnt 2>/dev/null; then
+              if find boot_mnt -maxdepth 3 \( -iname "*.dtb" -o -iname "dtb.img" -o -iname "*.dtsi" \) 2>/dev/null | grep -q .; then
+                echo "Boot-Partition gefunden: $part"
+                MOUNTED=true
+                break
+              else
+                sudo umount boot_mnt || sudo umount -l boot_mnt || true
+              fi
+            fi
+          done
+
+          if [ "$MOUNTED" = false ]; then
+            echo "::warning::Keine Partition mit DTB-Inhalten gefunden (möglicherweise proprietärer RKFW-Container). Fallback-Scan übernimmt."
+          else
+            echo "Kopiere alle .dtb Dateien aus Partition..."
+            find boot_mnt -type f \( -iname "*.dtb" -o -iname "*.dtsi" \) -exec cp {} dtb_output/ \; 2>/dev/null || true
+            if [ -f "boot_mnt/dtb.img" ]; then
+              cp boot_mnt/dtb.img dtb_output/active_rg43v_pro.dtb
+            fi
+            sudo umount boot_mnt || sudo umount -l boot_mnt || true
+          fi
+
+          sudo losetup -d "$LOOP_DEV" || true
+
+      - name: Fallback - DTB per Signatur-Scan direkt im Image finden
+        run: |
+          mkdir -p dtb_output
+          IMG="${{ env.IMG_FILE }}"
+          cat > /tmp/extract_dtb_by_signature.py << 'PYEOF'
           import sys, os, mmap, struct, subprocess
 
           img_path = sys.argv[1]
           outdir = sys.argv[2]
-          sub_dir = sys.argv[3]
           os.makedirs(outdir, exist_ok=True)
-          os.makedirs(sub_dir, exist_ok=True)
 
-          MAGIC_FDT = b'\xd0\x0d\xfe\xed'
-          MAGIC_RKFW = b'RKFW'
+          MAGIC = b'\xd0\x0d\xfe\xed'
           MIN_DTB_SIZE = 4 * 1024
           MAX_DTB_SIZE = 16 * 1024 * 1024
 
-          def scan_and_extract(file_path, prefix):
-              count = 0
-              if not os.path.exists(file_path):
-                  return 0
-              with open(file_path, 'rb') as f:
-                  try:
-                      mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
-                  except ValueError:
-                      return 0
+          found = []
+          try:
+              with open(img_path, 'rb') as f:
+                  mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
                   size = len(mm)
                   pos = 0
                   while True:
-                      idx = mm.find(MAGIC_FDT, pos)
+                      idx = mm.find(MAGIC, pos)
                       if idx == -1:
                           break
                       if idx + 8 <= size:
-                        try:
                           totalsize = struct.unpack('>I', mm[idx+4:idx+8])[0]
                           if MIN_DTB_SIZE <= totalsize <= MAX_DTB_SIZE and idx + totalsize <= size:
-                              blob = mm[idx:idx + totalsize]
-                              tmp_path = f"/tmp/_dtb_{prefix}_{idx}.dtb"
-                              with open(tmp_path, 'wb') as out:
-                                  out.write(blob)
-                              rc = subprocess.run(
-                                  ["dtc", "-I", "dtb", "-O", "dts", "-o", "/dev/null", tmp_path],
-                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                              ).returncode
-                              if rc == 0:
-                                  count += 1
-                                  final_path = os.path.join(outdir, f"{prefix}_offset_{idx}.dtb")
-                                  if not os.path.exists(final_path):
-                                      os.rename(tmp_path, final_path)
-                                      print(f"  [DTB Gefunden] {prefix} Offset {idx}, Größe {totalsize} -> {final_path}")
-                                  else:
-                                      os.remove(tmp_path)
-                              else:
-                                  if os.path.exists(tmp_path):
-                                      os.remove(tmp_path)
-                        except Exception:
-                          pass
+                              found.append((idx, totalsize))
                       pos = idx + 4
+
+                  print(f"Kandidaten mit gueltiger Magic + plausibler Groesse: {len(found)}")
+
+                  count = 0
+                  for idx, totalsize in found:
+                      blob = mm[idx:idx + totalsize]
+                      tmp_path = f"/tmp/_dtb_candidate_{idx}.dtb"
+                      with open(tmp_path, 'wb') as out:
+                          out.write(blob)
+                      
+                      # Strenge Prüfung: Nur behalten, wenn dtc keinen harten Fehler wirft
+                      rc = subprocess.run(
+                          ["dtc", "-I", "dtb", "-O", "dts", "-o", "/dev/null", tmp_path],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                      ).returncode
+                      
+                      if rc == 0:
+                          count += 1
+                          final_path = os.path.join(outdir, f"sig_offset_{idx}.dtb")
+                          os.rename(tmp_path, final_path)
+                          print(f"  OK: Offset {idx}, Groesse {totalsize} Bytes -> {final_path}")
+                      else:
+                          os.remove(tmp_path)
+
                   mm.close()
-              return count
-
-          # 1. Prüfen ob es ein Rockchip RKFW Container (update.img) ist und entpacken
-          with open(img_path, 'rb') as f:
-              header = f.read(4)
-
-          if header == MAGIC_RKFW:
-              print("Rockchip RKFW Container (update.img) erkannt. Analysiere Unterbilder...")
-              with open(img_path, 'rb') as f:
-                  f.seek(12)
-                  item_count = struct.unpack('<I', f.read(4))[0]
-                  print(f"RKFW enthält {item_count} Einträge.")
-                  f.seek(skiptemp := 20 + 4) # überspringe header info
-                  for _ in range(item_count):
-                      # RKFW item entry layout parsing approximation or robust block read
-                      pass
-              # Alternativ robuster Scan nach bekannten Teilbildern im RKFW (boot.img, resource.img)
-              with open(img_path, 'rb') as f:
-                  content = f.read()
-              for name_sig in [b'boot.img', b'resource.img', b'kernel.img', b'dtb.img']:
-                  pos = 0
-                  while True:
-                      idx = content.find(name_sig, pos)
-                      if idx == -1:
-                          break
-                      # Extrahiere Block um die Signatur herum als Sub-Image
-                      sub_img_path = os.path.join(sub_dir, f"sub_{name_sig.decode().split('.')[0]}_{idx}.img")
-                      start_chunk = max(0, idx - 1024)
-                      end_chunk = min(len(content), idx + 32 * 1024 * 1024)
-                      with open(sub_img_path, 'wb') as sf:
-                          sf.write(content[start_chunk:end_chunk])
-                      print(f"Sub-Image extrahiert: {sub_img_path}")
-                      pos = idx + len(name_sig)
-
-          # 2. Direkter Signatur-Scan auf das Hauptimage
-          total_found = scan_and_extract(img_path, "main")
-
-          # 3. Scan auf alle extrahierten Unterbilder
-          for sub_file in os.listdir(sub_dir):
-              sub_path = os.path.join(sub_dir, sub_file)
-              total_found += scan_and_extract(sub_path, f"sub_{sub_file}")
-
-          print(f"Insgesamt {total_found} valide DTB(s) durch erweiterten Scan extrahiert.")
-          sys.exit(0 if total_found > 0 else 1)
+              print(f"Insgesamt {count} valide DTB(s) per Signatur-Scan extrahiert.")
+              sys.exit(0 if count > 0 else 1)
+          except Exception as e:
+              print(f"Fehler beim Signatur-Scan: {e}")
+              sys.exit(1)
           PYEOF
 
-          python3 /tmp/extract_rockchip_dtb.py "$IMG" dtb_output extracted_subimages || true
-
-          # Partitions-Mount Fallback für standardkonforme Images
-          echo "Versuche zusätzlich Partitionen per Loop-Device einzubinden..."
-          LOOP_DEV=$(sudo losetup -Pf --show "$IMG" 2>/dev/null || true)
-          if [ -n "$LOOP_DEV" ]; then
-            sudo partprobe "$LOOP_DEV" 2>/dev/null || true
-            sleep 2
-            for part in "${LOOP_DEV}"p*; do
-              [ -b "$part" ] || continue
-              if sudo mount -o ro "$part" boot_mnt 2>/dev/null; then
-                find boot_mnt -type f \( -iname "*.dtb" -o -iname "dtb.img" -o -iname "*.dtsi" \) -exec cp {} dtb_output/ \; 2>/dev/null || true
-                sudo umount boot_mnt || sudo umount -l boot_mnt || true
-              fi
-            done
-            sudo losetup -d "$LOOP_DEV" || true
-          fi
-
-          echo "Inhalt des Ausgabeordners nach Extraktion:"
-          ls -la dtb_output/ || true
+          # Läuft immer ergänzend, falls die Partitions-Suche unvollständig war
+          python3 /tmp/extract_dtb_by_signature.py "$IMG" dtb_output || true
 
           if ! find dtb_output -type f \( -iname "*.dtb" \) 2>/dev/null | grep -q .; then
-            echo "::error::Kein gültiges DTB gefunden."
+            echo "::error::Weder Partitions-Suche noch Signatur-Scan haben ein gueltiges DTB gefunden."
             exit 1
           fi
 
@@ -255,10 +231,10 @@ jobs:
             [ -f "$dtb" ] || continue
             FOUND_DTB=true
             filename=$(basename -- "$dtb")
-            name="${filename%.*#}"
+            name="${filename%.*}"
             echo "Dekompiliere $filename zu DTS..."
             if ! dtc -@ -I dtb -O dts -o "dts_output/${name}.dts" "$dtb" 2> "dts_output/${name}.decompile.log"; then
-              echo "::warning::Fehler beim Dekompilieren von $dtb, siehe ${name}.decompile.log"
+              echo "::warning::Warnungen beim Dekompilieren von $dtb, siehe ${name}.decompile.log"
             fi
           done
 
@@ -273,17 +249,23 @@ jobs:
           cat > /tmp/analyze_dts_for_porting.py << 'PYEOF'
           import sys, os, re, glob
 
+          # Erweiterte Kategorien, speziell ausgerichtet auf Rockchip SoC (RK3562) und Porting
           CATEGORIES = [
               ("SoC / Board (Root-Eigenschaften)", None, 0),
               ("Speicher (memory-Knoten)", ["memory@", "device_type = \"memory\""], 20),
-              ("CPU / Taktstufen (OPP-Tabelle)", ["cpu@", "opp-table", "opp-microvolt", "opp-hz"], 60),
+              ("CPU / OPP-Tabelle (Taktstufen)", ["cpu@", "opp-table", "opp-microvolt", "opp-hz"], 60),
+              ("Rockchip System-Controller (GRF/PMU)", ["grf", "pmu", "syscon", "cru"], 40),
               ("Buttons (gpio-keys / adc-keys)", ["gpio-keys", "gpio_keys", "adc-keys", "adc_keys"], 120),
-              ("Analog-Sticks / Joystick", ["adc-joystick", "joystick", "abs_x", "abs-x", "abs_y", "play_joystick"], 80),
-              ("Akku / Ladeschaltung / PMIC", ["battery", "charger", "fuel-gauge", "rk817", "rk8xx", "axp"], 80),
-              ("WiFi / Bluetooth / SDIO", ["wifi", "sdio", "bluetooth", "rk915", "rk912"], 60),
-              ("Audio (Codec / SAI / I2S)", ["audio", "codec", "i2s", "sai", "rk817-codec", "sound"], 60),
-              ("Display / Panel / VOP / DSI", ["panel", "backlight", "lcd", "dsi", "vop", "rk628"], 60),
-              ("USB / OTG", ["usb", "otg", "dwc", "extcon"], 40),
+              ("Analog-Sticks / Joystick", ["adc-joystick", "joystick", "abs_x", "abs-x", "abs_y"], 80),
+              ("Akku / Ladeschaltung / PMIC", ["battery", "charger", "fuel-gauge", "rk817", "rk818", "rk8xx", "cw2015"], 100),
+              ("WiFi / Bluetooth / SDIO", ["wifi", "sdio", "bluetooth", "brcm", "rtl8", "aic8800", "wireless"], 80),
+              ("Audio (Codec / I2S / Sound)", ["audio", "codec", "i2s", "sound", "es8316", "rk817-codec"], 80),
+              ("Display / Panel / VOP / DSI", ["panel", "backlight", "lcd", "dsi", "vop", "hdmi", "route", "rgb"], 100),
+              ("Touchscreen", ["touchscreen", "goodix", "gt9", "ft5"], 60),
+              ("USB / OTG / PHY", ["usb", "otg", "dwc2", "dwc3", "extcon", "phy", "u2phy"], 80),
+              ("LEDs / PWM", ["gpio-leds", "leds {", "led@", "pwm"], 60),
+              ("Thermal-Zonen & Kühlung", ["thermal-zone", "thermal_zone", "cooling-maps"], 80),
+              ("Pinctrl (Pin-Multiplexing - Auszüge)", ["pinctrl", "pinmux", "iomux"], 150),
           ]
 
           NODE_OPEN_RE = re.compile(r'^(?P<name>.+?)\s*\{\s*$')
@@ -333,7 +315,7 @@ jobs:
               body = '\n'.join(text_lines)
               out = f"```dts\n{body}\n"
               if truncated:
-                  out += "    // ... (gekuerzt) ...\n"
+                  out += "    // ... (gekuerzt, siehe volle .dts-Datei fuer Rest) ...\n"
               out += "```\n"
               return out
 
@@ -345,9 +327,9 @@ jobs:
               nodes = parse_nodes(lines)
               root_props = extract_root_props(lines)
 
-              report = [f"# Porting-Notizen (Erweitert): {name}\n"]
+              report = [f"# Porting-Notizen: {name}\n"]
               report.append(f"Quelle: `{os.path.basename(dts_path)}`  \n")
-              report.append(f"Gefundene Knoten: {len(nodes)}\n\n")
+              report.append(f"Gefundene Knoten insgesamt: {len(nodes)}\n\n")
 
               report.append("## SoC / Board (Root-Eigenschaften)\n")
               if root_props:
@@ -387,20 +369,22 @@ jobs:
               out_path = os.path.join(outdir, f"{name}_PORTING_NOTES.md")
               with open(out_path, 'w') as f:
                   f.writelines(report)
-              print(f"Analyse geschrieben: {out_path}")
+              print(f"Geschrieben: {out_path}")
 
           if __name__ == "__main__":
               dts_dir = sys.argv[1]
               outdir = sys.argv[2]
               os.makedirs(outdir, exist_ok=True)
+              any_found = False
               for dts_path in sorted(glob.glob(os.path.join(dts_dir, "*.dts"))):
+                  any_found = True
                   analyze(dts_path, outdir)
+              if not any_found:
+                  print("Keine .dts-Dateien gefunden.")
+                  sys.exit(1)
           PYEOF
 
           python3 /tmp/analyze_dts_for_porting.py dts_output porting_notes
-
-          echo "Inhalt porting_notes/:"
-          ls -la porting_notes/
 
       - name: Ergebnisse als Artifact hochladen
         uses: actions/upload-artifact@v4
@@ -410,7 +394,7 @@ jobs:
             dtb_output/
             dts_output/
             porting_notes/
-          if-no-files-found: warn[cite: 14]
+          if-no-files-found: warn
 
       - name: Extrahierte DTB / DTS / Porting-Notizen ins Repo committen
         run: |
@@ -431,6 +415,6 @@ jobs:
             exit 0
           fi
 
-          git commit -m "Auto: DTB/DTS-Extraktion & Analyse RG43V-Pro (Run #${{ github.run_number }})"
+          git commit -m "Auto: DTB/DTS-Extraktion RG43V-Pro (Run #${{ github.run_number }})"
           git pull --rebase origin "${{ github.ref_name }}" || true
-          git push origin "HEAD:${{ github.ref_name }}"[cite: 14]
+          git push origin "HEAD:${{ github.ref_name }}"
