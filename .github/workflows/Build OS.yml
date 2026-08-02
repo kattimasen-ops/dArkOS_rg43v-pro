@@ -14,7 +14,7 @@ jobs:
       - name: System-Abhängigkeiten installieren
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget curl p7zip-full p7zip-rar xz-utils util-linux device-tree-compiler python3-pip fdisk
+          sudo apt-get install -y wget curl p7zip-full p7zip-rar xz-utils util-linux device-tree-compiler python3-pip fdisk coreutils
           pip3 install --upgrade pip
           pip3 install gdown requests
 
@@ -23,17 +23,14 @@ jobs:
           echo "Lade EmuELEC Firmware für RG43V-Pro herunter..."
           FILE_ID="1h7hc3wwdCgFMogr7Fi-W8EeQwp279Ipm"
           
-          # Versuch 1 mit gdown fuzzy
           gdown --fuzzy --id "$FILE_ID" -O firmware_archive || true
           
-          # Versuch 2 falls gdown das Limit erreicht hat oder fehlschlägt
           if [ ! -f "firmware_archive" ] || [ ! -s "firmware_archive" ]; then
             echo "Versuche alternativen Google Drive Direkt-Download..."
             CONFIRM=$(wget --save-cookies cookies.txt --keep-session-cookies --no-check-certificate -qO- "https://docs.google.com/uc?export=download&id=$FILE_ID" | grep -o 'confirm=[^&]*' | head -n 1)
             wget --load-cookies cookies.txt "https://docs.google.com/uc?export=download&confirm=$CONFIRM&id=$FILE_ID" -O firmware_archive || true
           fi
           
-          # Prüfung ob Datei erfolgreich da ist
           if [ ! -f "firmware_archive" ] || [ ! -s "firmware_archive" ]; then
             echo "Fehler: Download der Firmware endgültig fehlgeschlagen!"
             exit 1
@@ -41,7 +38,7 @@ jobs:
           echo "Firmware erfolgreich heruntergeladen. Dateigröße:"
           ls -lh firmware_archive
 
-      - name: Image-Datei entpacken
+      - name: Image-Datei entpacken und echtes Haupt-Image identifizieren
         run: |
           mkdir -p extracted_img
           echo "Prüfe Archiv-Typ und entpacke..."
@@ -56,12 +53,19 @@ jobs:
             mv firmware_archive extracted_img/firmware.img
           fi
           
-          IMG_FILE=$(find extracted_img -type f -name "*.img" | head -n 1)
+          echo "Alle gefundenen .img Dateien im Archiv:"
+          find extracted_img -type f -name "*.img" -ls
+          
+          # WICHTIG: Wir nehmen nicht mehr die erstbeste, sondern die GRÖSSTE .img Datei (das echte Image, keine kleinen Loader)
+          IMG_FILE=$(find extracted_img -type f -name "*.img" -printf "%s %p\n" | sort -nr | head -n 1 | awk '{print $2}')
+          
           if [ -z "$IMG_FILE" ] || [ ! -f "$IMG_FILE" ]; then
-            echo "Fehler: Keine .img Datei im Archiv gefunden!"
+            echo "Fehler: Keine gültige .img Datei im Archiv gefunden!"
             exit 1
           fi
-          echo "Gefundenes Image: $IMG_FILE"
+          
+          echo "Ausgewähltes Haupt-Image: $IMG_FILE"
+          ls -lh "$IMG_FILE"
           echo "IMG_FILE=$IMG_FILE" >> $GITHUB_ENV
 
       - name: Partitionen analysieren und per Offset mounten
@@ -160,4 +164,4 @@ jobs:
           name: rg43v-pro-dts-analysis
           path: |
             dtb_output/
-            dts_output/
+            dts_output/ 
