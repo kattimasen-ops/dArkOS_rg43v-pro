@@ -1,0 +1,15 @@
+dts_output/sig_offset_2776102.dts: Warning (spi_bus_reg): /spi@ff860000/flash@1: SPI bus unit address format error, expected "0"
+dts_output/sig_offset_2776102.dts: Warning (dmas_property): /serial@ff680000:dmas: Could not get phandle node for (cell 0)
+dts_output/sig_offset_2776102.dts: Warning (interrupts_property): /serial@ff680000: Missing interrupt-parent
+dts_output/sig_offset_2776102.dts: Warning (interrupts_property): /saradc@ff730000: Missing interrupt-parent
+dts_output/sig_offset_2776102.dts: Warning (interrupts_property): /usb2-phy@ff740000/otg-port: Missing interrupt-parent
+dts_output/sig_offset_2776102.dts: Warning (interrupts_property): /spi@ff860000: Missing interrupt-parent
+dts_output/sig_offset_2776102.dts: Warning (interrupts_property): /mmc@ff870000: Missing interrupt-parent
+dts_output/sig_offset_2776102.dts: Warning (interrupts_property): /mmc@ff880000: Missing interrupt-parent
+dts_output/sig_offset_2776102.dts: Warning (interrupts_property): /crypto@ff8a0000: Missing interrupt-parent
+dts_output/sig_offset_2776102.dts: Warning (interrupts_property): /rng@ff8e0000: Missing interrupt-parent
+dts_output/sig_offset_2776102.dts: Warning (interrupts_property): /pinctrl/gpio@ff260000: Missing interrupt-parent
+dts_output/sig_offset_2776102.dts: Warning (interrupts_property): /pinctrl/gpio@ff620000: Missing interrupt-parent
+dts_output/sig_offset_2776102.dts: Warning (interrupts_property): /pinctrl/gpio@ff630000: Missing interrupt-parent
+dts_output/sig_offset_2776102.dts: Warning (interrupts_property): /pinctrl/gpio@ffac0000: Missing interrupt-parent
+dts_output/sig_offset_2776102.dts: Warning (interrupts_property): /pinctrl/gpio@ffad0000: Missing interrupt-parent

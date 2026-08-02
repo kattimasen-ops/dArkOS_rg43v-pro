@@ -1,0 +1,26 @@
+dts_output/sig_offset_8296998.dts: Warning (unit_address_format): /reserved-memory/drm-logo@00000000: unit name should not have leading 0s
+dts_output/sig_offset_8296998.dts: Warning (unit_address_format): /reserved-memory/vendor-storage-rm@00000000: unit name should not have leading 0s
+dts_output/sig_offset_8296998.dts: Warning (unit_address_format): /reserved-memory/drm-cubic-lut@00000000: unit name should not have leading 0s
+dts_output/sig_offset_8296998.dts: Warning (simple_bus_reg): /clocks/xin32k: missing or empty reg/ranges property
+dts_output/sig_offset_8296998.dts: Warning (simple_bus_reg): /clocks/xin24m: missing or empty reg/ranges property
+dts_output/sig_offset_8296998.dts: Warning (simple_bus_reg): /clocks/mclkin-sai0: missing or empty reg/ranges property
+dts_output/sig_offset_8296998.dts: Warning (simple_bus_reg): /clocks/mclkin-sai1: missing or empty reg/ranges property
+dts_output/sig_offset_8296998.dts: Warning (simple_bus_reg): /clocks/mclkin-sai2: missing or empty reg/ranges property
+dts_output/sig_offset_8296998.dts: Warning (unique_unit_address): /clocks/hclk_vepu@ff100324: duplicate unit-address (also used in node /clocks/aclk_vepu@ff100324)
+dts_output/sig_offset_8296998.dts: Warning (unique_unit_address): /clocks/mclkout-sai0@ff040070: duplicate unit-address (also used in node /clocks/mclkout-sai1@ff040070)
+dts_output/sig_offset_8296998.dts: Warning (unique_unit_address): /clocks/mclkout-sai0@ff040070: duplicate unit-address (also used in node /clocks/mclkout-sai2@ff040070)
+dts_output/sig_offset_8296998.dts: Warning (unique_unit_address): /clocks/mclkout-sai1@ff040070: duplicate unit-address (also used in node /clocks/mclkout-sai2@ff040070)
+dts_output/sig_offset_8296998.dts: Warning (unique_unit_address): /reserved-memory/drm-logo@00000000: duplicate unit-address (also used in node /reserved-memory/vendor-storage-rm@00000000)
+dts_output/sig_offset_8296998.dts: Warning (unique_unit_address): /reserved-memory/drm-logo@00000000: duplicate unit-address (also used in node /reserved-memory/drm-cubic-lut@00000000)
+dts_output/sig_offset_8296998.dts: Warning (unique_unit_address): /reserved-memory/vendor-storage-rm@00000000: duplicate unit-address (also used in node /reserved-memory/drm-cubic-lut@00000000)
+dts_output/sig_offset_8296998.dts: Warning (unique_unit_address): /otp@ff930000/mbist-vmin@9: duplicate unit-address (also used in node /otp@ff930000/log-mbist-vmin@9)
+dts_output/sig_offset_8296998.dts: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+dts_output/sig_offset_8296998.dts: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+dts_output/sig_offset_8296998.dts: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+dts_output/sig_offset_8296998.dts: Warning (alias_paths): /aliases: aliases property name must include only lowercase and '-'
+dts_output/sig_offset_8296998.dts: Warning (graph_child_address): /syscon@ff030000/lvds/ports: graph node has single child node 'port@0', #address-cells/#size-cells are not necessary
+dts_output/sig_offset_8296998.dts: Warning (graph_child_address): /syscon@ff030000/lvds/ports/port@0: graph node has single child node 'endpoint@0', #address-cells/#size-cells are not necessary
+dts_output/sig_offset_8296998.dts: Warning (graph_child_address): /syscon@ff060000/rgb/ports/port@0: graph node has single child node 'endpoint@0', #address-cells/#size-cells are not necessary
+dts_output/sig_offset_8296998.dts: Warning (graph_child_address): /vop@ff400000/ports: graph node has single child node 'port@0', #address-cells/#size-cells are not necessary
+dts_output/sig_offset_8296998.dts: Warning (graph_child_address): /dsi@ffb10000/ports/port@0: graph node has single child node 'endpoint@0', #address-cells/#size-cells are not necessary
+dts_output/sig_offset_8296998.dts: Warning (graph_child_address): /dsi@ffb10000/panel@0/ports: graph node has single child node 'port@0', #address-cells/#size-cells are not necessary
