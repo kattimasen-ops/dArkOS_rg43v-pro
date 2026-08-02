@@ -8,6 +8,10 @@ on:
         required: false
         default: "1h7hc3wwdCgFMogr7Fi-W8EeQwp279Ipm"
 
+permissions:
+  contents: write   # noetig, damit der Commit/Push-Schritt am Ende mit dem
+                     # eingebauten GITHUB_TOKEN ins Repo schreiben darf
+
 jobs:
   extract-and-decompile:
     runs-on: ubuntu-latest
@@ -292,45 +296,182 @@ jobs:
             exit 1
           fi
 
-      - name: GPIO / Pinctrl / Input-Belegung zusammenfassen
+      - name: DTS für darkOS-Porting analysieren
+        # Ersetzt die alte, einfache awk/grep-Zusammenfassung durch einen
+        # klammer-tiefen-genauen Parser: die alte awk-Regel brach bei
+        # verschachtelten Kind-Knoten (z.B. gpio-keys mit mehreren
+        # "button@N"-Unterknoten), weil sie einfach beim naechsten "};"
+        # abgeschnitten hat statt die tatsaechliche Knotengrenze zu
+        # verfolgen. Hier wird pro Zeile die Klammertiefe mitgezaehlt,
+        # wodurch jeder Knoten inkl. aller Kinder vollstaendig und korrekt
+        # extrahiert wird - unabhaengig davon, wie tief er verschachtelt ist.
         run: |
-          mkdir -p gpio_summary
-          for dts in dts_output/*.dts; do
-            [ -f "$dts" ] || continue
-            name=$(basename -- "$dts" .dts)
-            out="gpio_summary/${name}_gpio_summary.txt"
-            {
-              echo "=== GPIO/Pinctrl/Input-Zusammenfassung: $name ==="
-              echo ""
-              echo "--- gpio-keys / adc-keys (Buttons) ---"
-              awk '/gpio-keys|adc-keys/{f=1} f{print} /};/{if(f){f=0; print "---"}}' "$dts" 2>/dev/null
+          mkdir -p porting_notes
+          cat > /tmp/analyze_dts_for_porting.py << 'PYEOF'
+          import sys, os, re, glob
 
-              echo ""
-              echo "--- pinctrl-Knoten ---"
-              grep -n "pinctrl" "$dts" 2>/dev/null
+          # (Ueberschrift, [Schluesselwoerter case-insensitive], max. Zeilen pro Knoten)
+          CATEGORIES = [
+              ("SoC / Board (Root-Eigenschaften)", None, 0),
+              ("Speicher (memory-Knoten)", ["memory@", "device_type = \"memory\""], 20),
+              ("CPU / Taktstufen (OPP-Tabelle)", ["cpu@", "opp-table", "opp-microvolt", "opp-hz"], 60),
+              ("Buttons (gpio-keys / adc-keys)", ["gpio-keys", "gpio_keys", "adc-keys", "adc_keys"], 120),
+              ("Analog-Sticks (ADC-Joystick)", ["adc-joystick", "joystick", "abs_x", "abs-x", "abs_y"], 80),
+              ("Akku / Ladeschaltung / Fuel-Gauge", ["battery", "charger", "fuel-gauge", "fuel_gauge",
+                  "cw2015", "cw2017", "axp", "bq27", "max1704", "rk818", "rk8xx"], 80),
+              ("WiFi / Bluetooth", ["wifi", "sdio", "bluetooth", "bt_dev", "brcm", "rtl8", "aml_wifi", "aic8800"], 60),
+              ("Audio (Codec / I2S)", ["audio", "codec", "i2s", "es8316", "es8388", "dmic", "sound"], 60),
+              ("Display / Panel / Backlight", ["panel", "backlight", "lcd", "dsi", "vout", "hdmi"], 60),
+              ("Touchscreen", ["touchscreen", "goodix", "gt9", "ft5", "gslx"], 40),
+              ("USB / OTG", ["usb", "otg", "dwc2", "dwc3", "extcon"], 40),
+              ("LEDs", ["gpio-leds", "leds {", "led@", "led-"], 40),
+              ("RTC (Echtzeituhr)", ["rtc@", "rtc {", "rtc0", "rtc1"], 20),
+              ("Sensoren (Gyro / Accel)", ["gyro", "accel", "mpu6", "bma2", "icm4", "qmi8"], 40),
+              ("Thermal-Zonen", ["thermal-zone", "thermal_zone", "cooling-maps", "cooling-device"], 60),
+              ("Regulatoren (Spannungsversorgung)", ["regulator"], 30),
+              ("Pinctrl (Pin-Multiplexing)", ["pinctrl", "pinmux", "pinconf", "pinctrl-0", "iomux"], 40),
+          ]
 
-              echo ""
-              echo "--- GPIO-Referenzen (<&gpioX ...>) ---"
-              grep -noE "&gpio[a-z0-9_]*[^;]*" "$dts" 2>/dev/null
+          NODE_OPEN_RE = re.compile(r'^(?P<name>.+?)\s*\{\s*$')
+          NODE_CLOSE_RE = re.compile(r'^\}\s*;?\s*$')
 
-              echo ""
-              echo "--- Regulatoren (vdd/vcc, für Spannungsversorgung wichtig) ---"
-              grep -noE "regulator-name = \"[^\"]*\"" "$dts" 2>/dev/null
+          def parse_nodes(lines):
+              """Klammertiefen-genaue Extraktion aller Knotenblöcke inkl. Kinder."""
+              stack = []
+              nodes = []
+              for i, raw in enumerate(lines):
+                  line = raw.rstrip('\n')
+                  stripped = line.strip()
+                  for frame in stack:
+                      frame['lines'].append(line)
+                  m = NODE_OPEN_RE.match(stripped)
+                  if m and not stripped.startswith('/*'):
+                      stack.append({'name': m.group('name').strip(), 'start': i, 'lines': [line]})
+                  elif NODE_CLOSE_RE.match(stripped):
+                      if stack:
+                          frame = stack.pop()
+                          nodes.append({
+                              'name': frame['name'],
+                              'start': frame['start'],
+                              'end': i,
+                              'text': '\n'.join(frame['lines']),
+                          })
+              return nodes
 
-              echo ""
-              echo "--- Display / Backlight ---"
-              grep -n "backlight\|panel\|lcd\|display" "$dts" 2>/dev/null
+          def extract_root_props(lines):
+              # Root-Eigenschaften stehen direkt unter "/ {" auf oberster Ebene,
+              # bevor der erste Kind-Knoten geoeffnet wird.
+              depth = 0
+              props = {}
+              for raw in lines:
+                  line = raw.strip()
+                  if depth == 1:
+                      mm = re.match(r'(compatible|model|serial-number)\s*=\s*(.+);', line)
+                      if mm:
+                          props[mm.group(1)] = mm.group(2)
+                  depth += line.count('{') - line.count('}')
+              return props
 
-              echo ""
-              echo "--- Audio ---"
-              grep -n "audio\|codec\|i2s\|es8316\|es8388" "$dts" 2>/dev/null
+          def render_node(node, max_lines):
+              text = node['text']
+              text_lines = text.split('\n')
+              truncated = False
+              if max_lines and len(text_lines) > max_lines:
+                  text_lines = text_lines[:max_lines]
+                  truncated = True
+              body = '\n'.join(text_lines)
+              out = f"```dts\n{body}\n"
+              if truncated:
+                  out += "    // ... (gekuerzt, siehe volle .dts-Datei fuer Rest) ...\n"
+              out += "```\n"
+              return out
 
-              echo ""
-              echo "--- WiFi / SDIO / Bluetooth ---"
-              grep -n "sdio\|wifi\|bluetooth\|bt_" "$dts" 2>/dev/null
-            } > "$out"
-            echo "Zusammenfassung geschrieben: $out"
-          done
+          def analyze(dts_path, outdir):
+              with open(dts_path, 'r', errors='replace') as f:
+                  lines = f.readlines()
+
+              name = os.path.splitext(os.path.basename(dts_path))[0]
+              nodes = parse_nodes(lines)
+              root_props = extract_root_props(lines)
+
+              report = [f"# Porting-Notizen: {name}\n"]
+              report.append(f"Quelle: `{os.path.basename(dts_path)}`  \n")
+              report.append(f"Gefundene Knoten insgesamt: {len(nodes)}\n\n")
+
+              report.append("## SoC / Board (Root-Eigenschaften)\n")
+              if root_props:
+                  for k, v in root_props.items():
+                      report.append(f"- **{k}** = {v}\n")
+              else:
+                  report.append("_Keine root `compatible`/`model`-Zeile gefunden._\n")
+              report.append("\n")
+
+              for title, keywords, max_lines in CATEGORIES:
+                  if keywords is None:
+                      continue  # Root-Block oben separat behandelt
+                  matches = []
+                  for node in nodes:
+                      if node['name'] == '/':
+                          continue  # Root separat oben behandelt, sein Text
+                                    # enthaelt sonst den kompletten Baum und
+                                    # wuerde in fast jede Kategorie matchen
+                      haystack = (node['name'] + '\n' + node['text']).lower()
+                      if any(kw.lower() in haystack for kw in keywords):
+                          matches.append(node)
+                  # Wenn sowohl ein Vorfahre als auch ein spezifisches Kind
+                  # matchen (z.B. "gpio-keys" und darin "button@0"), nur den
+                  # kleinsten/spezifischsten Knoten behalten - sonst wuerde
+                  # der Vorfahre den kompletten (teils riesigen) Teilbaum
+                  # nochmal komplett mit ausgeben.
+                  matches.sort(key=lambda n: (n['end'] - n['start']))
+                  filtered = []
+                  for node in matches:
+                      if any(a['start'] >= node['start'] and a['end'] <= node['end'] for a in filtered):
+                          continue
+                      filtered.append(node)
+                  filtered.sort(key=lambda n: n['start'])
+
+                  report.append(f"## {title}\n")
+                  if not filtered:
+                      report.append("_Nichts gefunden._\n\n")
+                      continue
+                  for node in filtered:
+                      report.append(f"### `{node['name']}` (Zeile {node['start']+1}-{node['end']+1})\n")
+                      report.append(render_node(node, max_lines))
+                      report.append("\n")
+
+              report.append("## Kurze GPIO-Referenzliste (alle `&gpioX ...`)\n")
+              gpio_refs = sorted(set(re.findall(r'&gpio[a-z0-9_]*\s*[^;,\n>]*', '\n'.join(lines), re.IGNORECASE)))
+              if gpio_refs:
+                  for ref in gpio_refs[:200]:
+                      report.append(f"- `{ref.strip()}`\n")
+                  if len(gpio_refs) > 200:
+                      report.append(f"- ... ({len(gpio_refs)-200} weitere, siehe volle .dts-Datei)\n")
+              else:
+                  report.append("_Keine gefunden._\n")
+
+              out_path = os.path.join(outdir, f"{name}_PORTING_NOTES.md")
+              with open(out_path, 'w') as f:
+                  f.writelines(report)
+              print(f"Geschrieben: {out_path}")
+
+          if __name__ == "__main__":
+              dts_dir = sys.argv[1]
+              outdir = sys.argv[2]
+              os.makedirs(outdir, exist_ok=True)
+              any_found = False
+              for dts_path in sorted(glob.glob(os.path.join(dts_dir, "*.dts"))):
+                  any_found = True
+                  analyze(dts_path, outdir)
+              if not any_found:
+                  print("Keine .dts-Dateien gefunden.")
+                  sys.exit(1)
+          PYEOF
+
+          python3 /tmp/analyze_dts_for_porting.py dts_output porting_notes
+
+          echo "Inhalt porting_notes/:"
+          ls -la porting_notes/
 
       - name: Ergebnisse als Artifact hochladen
         uses: actions/upload-artifact@v4
@@ -339,5 +480,35 @@ jobs:
           path: |
             dtb_output/
             dts_output/
-            gpio_summary/
+            porting_notes/
           if-no-files-found: warn
+
+      - name: Extrahierte DTB / DTS / Porting-Notizen ins Repo committen
+        # Laedt zusaetzlich zum Artifact (das nach 90 Tagen ablaeuft) eine
+        # dauerhafte Kopie direkt ins Repo, damit die Analyse fuer den
+        # darkOS-Port-Branch versioniert erhalten bleibt.
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          DEST="porting/rg43v-pro"
+          mkdir -p "$DEST/dtb" "$DEST/dts" "$DEST/notes"
+
+          cp -f dtb_output/*.dtb "$DEST/dtb/" 2>/dev/null || true
+          cp -f dts_output/*.dts "$DEST/dts/" 2>/dev/null || true
+          cp -f dts_output/*.decompile.log "$DEST/dts/" 2>/dev/null || true
+          cp -f porting_notes/*.md "$DEST/notes/" 2>/dev/null || true
+
+          git add "$DEST"
+          if git diff --cached --quiet; then
+            echo "Keine Aenderungen gegenueber dem Repo-Stand - nichts zu committen."
+            exit 0
+          fi
+
+          git commit -m "Auto: DTB/DTS-Extraktion RG43V-Pro (Run #${{ github.run_number }})"
+
+          # Rebase gegen den aktuellen Stand, falls zwischenzeitlich jemand
+          # anderes gepusht hat, dann erst pushen.
+          git pull --rebase origin "${{ github.ref_name }}" || true
+          git push origin "HEAD:${{ github.ref_name }}"
+
