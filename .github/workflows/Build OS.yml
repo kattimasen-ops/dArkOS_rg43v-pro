@@ -1,0 +1,94 @@
+name: Extract & Decompile RG43V-Pro DTB
+
+on:
+  workflow_dispatch:
+
+jobs:
+  extract-and-decompile:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Repository auschecken
+        uses: actions/checkout@v4
+
+      - name: System-Abhängigkeiten installieren
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget curl p7zip-full p7zip-rar xz-utils kpartx device-tree-compiler python3-pip
+          pip3 install gdown
+
+      - name: Firmware von Google Drive herunterladen
+        run: |
+          echo "Lade EmuELEC Firmware für RG43V-Pro herunter..."
+          # Nutzt gdown, um den Google Drive Direktlink sicher abzurufen
+          gdown "https://drive.google.com/file/d/1h7hc3wwdCgFMogr7Fi-W8EeQwp279Ipm/view?usp=sharing" -O firmware_archive
+          
+      - name: Image-Datei entpacken
+        run: |
+          mkdir extracted_img
+          echo "Prüfe Archiv-Typ und entpacke..."
+          
+          if 7z l firmware_archive > /dev/null 2>&1; then
+            7z x firmware_archive -oextracted_img/
+          elif gzip -t firmware_archive > /dev/null 2>&1; then
+            gunzip -c firmware_archive > extracted_img/firmware.img
+          elif xz -t firmware_archive > /dev/null 2>&1; then
+            unxz -c firmware_archive > extracted_img/firmware.img
+          else
+            mv firmware_archive extracted_img/firmware.img
+          fi
+          
+          IMG_FILE=$(find extracted_img -type f -name "*.img" | head -n 1)
+          if [ -z "$IMG_FILE" ]; then
+            echo "Fehler: Keine .img Datei im Archiv gefunden!"
+            exit 1
+          fi
+          echo "Gefundenes Image: $IMG_FILE"
+          echo "IMG_FILE=$IMG_FILE" >> $GITHUB_ENV
+
+      - name: Image mounten und DTB/DTSI extrahieren
+        run: |
+          mkdir dtb_output
+          
+          sudo kpartx -av "${{ env.IMG_FILE }}"
+          
+          LOOP_DEV=$(sudo kpartx -l "${{ env.IMG_FILE }}" | head -n 1 | awk '{print $1}')
+          
+          if [ -z "$LOOP_DEV" ]; then
+            echo "Konnte die Boot-Partition nicht erkennen."
+            exit 1
+          fi
+          
+          mkdir boot_mnt
+          sudo mount "/dev/mapper/$LOOP_DEV" boot_mnt
+          
+          echo "Kopiere alle .dtb und .dtsi Dateien aus der EmuELEC Partition..."
+          find boot_mnt -type f \( -name "*.dtb" -o -name "*.dtsi" \) -exec cp {} dtb_output/ \;
+          
+          if [ -f "boot_mnt/dtb.img" ]; then
+            echo "Aktive dtb.img gefunden!"
+            cp boot_mnt/dtb.img dtb_output/active_rg43v_pro.dtb
+          fi
+          
+          sudo umount boot_mnt
+          sudo kpartx -dv "${{ env.IMG_FILE }}"
+
+      - name: DTB zu DTS dekompilieren
+        run: |
+          mkdir dts_output
+          for dtb in dtb_output/*.dtb; do
+            if [ -f "$dtb" ]; then
+              filename=$(basename -- "$dtb")
+              name="${filename%.*}"
+              echo "Dekompiliere $filename zu DTS..."
+              dtc -I dtb -O dts -o "dts_output/${name}.dts" "$dtb" || echo "Fehler bei $dtb"
+            fi
+          done
+
+      - name: Ergebnisse als Artifact hochladen
+        uses: actions/upload-artifact@v4
+        with:
+          name: rg43v-pro-dts-analysis
+          path: |
+            dtb_output/
+            dts_output/
