@@ -2,6 +2,11 @@ name: Extract & Decompile RG43V-Pro DTB
 
 on:
   workflow_dispatch:
+    inputs:
+      file_id:
+        description: "Google Drive File-ID der EmuELEC-Firmware (Override, optional)"
+        required: false
+        default: "1h7hc3wwdCgFMogr7Fi-W8EeQwp279Ipm"
 
 jobs:
   extract-and-decompile:
@@ -13,36 +18,83 @@ jobs:
 
       - name: System-Abhängigkeiten installieren
         run: |
+          set -e
           sudo apt-get update
-          sudo apt-get install -y wget curl p7zip-full p7zip-rar xz-utils util-linux device-tree-compiler python3-pip fdisk coreutils
-          pip3 install --upgrade pip
-          pip3 install gdown requests
+          sudo apt-get install -y wget curl p7zip-full p7zip-rar xz-utils util-linux \
+            device-tree-compiler python3-pip fdisk kpartx
+          # Ubuntu 24.04-Runner haben ein "externally-managed-environment" (PEP 668) -
+          # ohne --break-system-packages schlägt pip3 install sonst fehl.
+          pip3 install --upgrade pip --break-system-packages
+          pip3 install gdown requests --break-system-packages
 
-      - name: Firmware von Google Drive herunterladen (Robuster Download)
+      - name: Firmware von Google Drive herunterladen (robuster Download mit Retry)
+        env:
+          FILE_ID: ${{ inputs.file_id }}
         run: |
-          echo "Lade EmuELEC Firmware für RG43V-Pro herunter..."
-          FILE_ID="1h7hc3wwdCgFMogr7Fi-W8EeQwp279Ipm"
-          
-          gdown --fuzzy --id "$FILE_ID" -O firmware_archive || true
-          
-          if [ ! -f "firmware_archive" ] || [ ! -s "firmware_archive" ]; then
-            echo "Versuche alternativen Google Drive Direkt-Download..."
-            CONFIRM=$(wget --save-cookies cookies.txt --keep-session-cookies --no-check-certificate -qO- "https://docs.google.com/uc?export=download&id=$FILE_ID" | grep -o 'confirm=[^&]*' | head -n 1)
-            wget --load-cookies cookies.txt "https://docs.google.com/uc?export=download&confirm=$CONFIRM&id=$FILE_ID" -O firmware_archive || true
+          echo "Lade EmuELEC Firmware für RG43V-Pro herunter (File-ID: $FILE_ID)..."
+          rm -f firmware_archive
+
+          # Versuch 1: gdown mit der bekannten Share-URL (nicht --id mit --fuzzy mischen,
+          # das ist in aktuellen gdown-Versionen kein gültiger Aufruf mehr).
+          for attempt in 1 2 3; do
+            echo "gdown-Versuch $attempt..."
+            gdown --fuzzy "https://drive.google.com/file/d/${FILE_ID}/view" -O firmware_archive && break
+            sleep 5
+          done
+
+          # Versuch 2: gdown direkt über die uc-URL (funktioniert manchmal, wenn --fuzzy scheitert)
+          if [ ! -s firmware_archive ]; then
+            echo "gdown --fuzzy fehlgeschlagen, versuche gdown mit uc-URL..."
+            gdown "https://drive.google.com/uc?id=${FILE_ID}" -O firmware_archive || true
           fi
-          
-          if [ ! -f "firmware_archive" ] || [ ! -s "firmware_archive" ]; then
-            echo "Fehler: Download der Firmware endgültig fehlgeschlagen!"
+
+          # Versuch 3: manueller wget-Fallback für große Dateien, bei denen Google Drive
+          # die "Kann nicht auf Viren geprüft werden"-Warnung zeigt. Google verlangt hierfür
+          # inzwischen einfach "confirm=t" als Query-Parameter (kein Token-Scraping mehr nötig),
+          # zusammen mit dem Session-Cookie aus dem ersten Request.
+          if [ ! -s firmware_archive ]; then
+            echo "Versuche manuellen Google-Drive-Download (confirm=t)..."
+            wget --save-cookies cookies.txt --keep-session-cookies --no-check-certificate -q \
+              "https://drive.google.com/uc?export=download&id=${FILE_ID}" -O /dev/null
+            wget --load-cookies cookies.txt --no-check-certificate \
+              "https://drive.google.com/uc?export=download&confirm=t&id=${FILE_ID}" \
+              -O firmware_archive || true
+            rm -f cookies.txt
+          fi
+
+          if [ ! -s firmware_archive ]; then
+            echo "::error::Download der Firmware endgültig fehlgeschlagen (alle 3 Methoden)."
             exit 1
           fi
+
+          # KRITISCHER SANITY-CHECK: Ein echtes EmuELEC-Image ist mehrere
+          # hundert MB bis GB groß. Wenn Google Drive z.B. wegen
+          # Download-Kontingent ("quota exceeded") oder fehlender
+          # Freigabe nur eine kleine HTML-Fehlerseite zurückgibt, wird die
+          # trotzdem "erfolgreich" heruntergeladen (Datei ist ja nicht leer!)
+          # - nur eben Datenmüll. Ohne diese Prüfung läuft der Workflow
+          # bis zur Partitionssuche durch und scheitert dort mit einer
+          # verwirrenden "keine Partition gefunden"-Meldung.
+          FW_SIZE=$(stat -c%s firmware_archive)
+          MIN_SIZE=$((20*1024*1024))  # 20 MB
+          if [ "$FW_SIZE" -lt "$MIN_SIZE" ]; then
+            echo "::error::Download ist verdächtig klein (${FW_SIZE} Bytes) - das ist keine echte Firmware, vermutlich eine Google-Drive-Fehler-/Quota-Seite."
+            echo "--- Inhalt der Datei (falls Text/HTML) ---"
+            head -c 4000 firmware_archive | strings | head -60
+            echo "--- Mögliche Ursachen: Datei nicht auf 'Jeder mit Link' freigegeben, Tages-Downloadkontingent von Google Drive für diese Datei erschöpft, oder falsche FILE_ID ---"
+            exit 1
+          fi
+
           echo "Firmware erfolgreich heruntergeladen. Dateigröße:"
           ls -lh firmware_archive
+          file firmware_archive || true
 
-      - name: Image-Datei entpacken und echtes Haupt-Image identifizieren
+      - name: Image-Datei entpacken
         run: |
+          set -e
           mkdir -p extracted_img
           echo "Prüfe Archiv-Typ und entpacke..."
-          
+
           if 7z l firmware_archive > /dev/null 2>&1; then
             7z x firmware_archive -oextracted_img/
           elif gzip -t firmware_archive > /dev/null 2>&1; then
@@ -50,113 +102,158 @@ jobs:
           elif xz -t firmware_archive > /dev/null 2>&1; then
             unxz -c firmware_archive > extracted_img/firmware.img
           else
+            # Kein bekanntes Archivformat -> vermutlich schon ein rohes .img
             mv firmware_archive extracted_img/firmware.img
           fi
-          
-          echo "Alle gefundenen .img Dateien im Archiv:"
-          find extracted_img -type f -name "*.img" -ls
-          
-          # WICHTIG: Wir nehmen nicht mehr die erstbeste, sondern die GRÖSSTE .img Datei (das echte Image, keine kleinen Loader)
-          IMG_FILE=$(find extracted_img -type f -name "*.img" -printf "%s %p\n" | sort -nr | head -n 1 | awk '{print $2}')
-          
+
+          # Case-insensitive suchen (.img / .IMG) und notfalls die größte Datei
+          # im Ordner nehmen, falls der Hersteller eine andere Endung nutzt
+          # (z.B. .PARTITION, kein Suffix, o.ä.).
+          IMG_FILE=$(find extracted_img -type f -iname "*.img" | head -n 1)
+          if [ -z "$IMG_FILE" ]; then
+            echo "Keine *.img gefunden, nehme größte Datei im Archiv als Image an..."
+            IMG_FILE=$(find extracted_img -type f -printf '%s %p\n' | sort -rn | head -n 1 | cut -d' ' -f2-)
+          fi
           if [ -z "$IMG_FILE" ] || [ ! -f "$IMG_FILE" ]; then
-            echo "Fehler: Keine gültige .img Datei im Archiv gefunden!"
+            echo "::error::Keine verwertbare Image-Datei im Archiv gefunden!"
+            find extracted_img -type f
             exit 1
           fi
-          
-          echo "Ausgewähltes Haupt-Image: $IMG_FILE"
-          ls -lh "$IMG_FILE"
-          echo "IMG_FILE=$IMG_FILE" >> $GITHUB_ENV
+          echo "Gefundenes Image: $IMG_FILE"
 
-      - name: Partitionen analysieren und per Offset mounten
+          # Gleicher Sanity-Check wie nach dem Download, diesmal auf das
+          # entpackte Image: verhindert genau den Fehler aus deinem Log
+          # ("Disk ...: 2 KiB, 2048 bytes, 4 sectors") - ein 2KB-"Image"
+          # kann niemals eine echte Partitionstabelle mit Boot-Partition
+          # enthalten, also lieber hier sofort klar abbrechen.
+          IMG_SIZE=$(stat -c%s "$IMG_FILE")
+          MIN_IMG_SIZE=$((50*1024*1024))  # 50 MB
+          if [ "$IMG_SIZE" -lt "$MIN_IMG_SIZE" ]; then
+            echo "::error::Entpacktes Image ist unrealistisch klein (${IMG_SIZE} Bytes / $(numfmt --to=iec $IMG_SIZE 2>/dev/null || echo '?')) - das kann kein vollständiges Firmware-Image sein."
+            file "$IMG_FILE" || true
+            echo "--- Inhalt (falls Text) ---"
+            head -c 2000 "$IMG_FILE" | strings | head -30
+            echo "--- Prüfe den vorherigen Download-Schritt bzw. das Archivformat - die Extraktion ist vermutlich fehlgeschlagen oder das Archiv war unvollständig ---"
+            exit 1
+          fi
+          echo "Image-Größe OK: ${IMG_SIZE} Bytes"
+          echo "IMG_FILE=$IMG_FILE" >> "$GITHUB_ENV"
+
+      - name: Partitionen per Loop-Device einbinden und DTB suchen
         run: |
-          mkdir -p dtb_output
-          mkdir -p boot_mnt
-          
+          mkdir -p dtb_output boot_mnt
           IMG="${{ env.IMG_FILE }}"
-          echo "Analysiere Partitionstabelle von: $IMG"
-          
-          fdisk -l "$IMG"
-          
+          echo "Partitionstabelle von: $IMG"
+          fdisk -l "$IMG" || true
+
+          # Statt Startsektoren manuell aus "fdisk -l" zu parsen (bricht bei GPT-Images,
+          # bei der Boot-Flag-Spalte "*" bei MBR, und bei wechselnder Kopfzeilenzahl),
+          # nutzen wir losetup -P: der Kernel erstellt automatisch /dev/loopXpN für
+          # jede Partition, egal ob MBR oder GPT. Das ist deutlich robuster.
+          LOOP_DEV=$(sudo losetup -Pf --show "$IMG")
+          echo "Image als $LOOP_DEV eingebunden, warte auf Partitions-Nodes..."
+          sudo partprobe "$LOOP_DEV" 2>/dev/null || true
+          sleep 2
+          ls -la "${LOOP_DEV}"p* 2>/dev/null || true
+
           MOUNTED=false
-          
-          # Automatisches Auslesen der Startsektoren über fdisk
-          while read -r start_sect; do
-            if [[ "$start_sect" =~ ^[0-9]+$ ]]; then
-              OFFSET=$((start_sect * 512))
-              echo "Teste Partition mit Startsektor $start_sect (Offset: $OFFSET Bytes)..."
-              
-              if sudo mount -o loop,offset=$OFFSET "$IMG" boot_mnt 2>/dev/null; then
-                echo "Erfolgreich gemountet mit Offset $OFFSET!"
-                
-                if find boot_mnt -name "*.dtb" -o -name "dtb.img" -o -name "*.dtsi" | grep -q .; then
-                  echo "Boot-Partition anhand von DTB-Inhalten identifiziert!"
-                  MOUNTED=true
-                  break
-                else
-                  echo "Keine DTB-Inhalte in diesem Offset, unmounten..."
-                  sudo umount boot_mnt || true
-                fi
+          for part in "${LOOP_DEV}"p*; do
+            [ -b "$part" ] || continue
+            echo "Teste Partition $part ..."
+            if sudo mount -o ro "$part" boot_mnt 2>/dev/null; then
+              if find boot_mnt -maxdepth 3 \( -iname "*.dtb" -o -iname "dtb.img" -o -iname "*.dtsi" \) 2>/dev/null | grep -q .; then
+                echo "Boot-Partition gefunden: $part"
+                MOUNTED=true
+                break
+              else
+                sudo umount boot_mnt || sudo umount -l boot_mnt || true
               fi
             fi
-          done <<EOF
-          $(fdisk -l "$IMG" | awk 'NR>7 {print $2}')
-          EOF
-          
-          # Fallback für feste Standard-Offsets bei eMMC-Images
+          done
+
           if [ "$MOUNTED" = false ]; then
-            echo "Automatischer Offset fehlgeschlagen, teste bekannte Standard-Offsets..."
-            for sect in 16384 32768 8192 2048 65536 1024; do
-              OFFSET=$((sect * 512))
-              echo "Teste festen Offset: $OFFSET Bytes..."
-              if sudo mount -o loop,offset=$OFFSET "$IMG" boot_mnt 2>/dev/null; then
-                if find boot_mnt -name "*.dtb" -o -name "dtb.img" -o -name "*.dtsi" | grep -q .; then
-                  echo "Boot-Partition mit festem Offset $OFFSET gefunden!"
-                  MOUNTED=true
-                  break
-                else
-                  sudo umount boot_mnt || true
-                fi
-              fi
-            done
-          fi
-          
-          if [ "$MOUNTED" = false ]; then
-            echo "Fehler: Konnte keine Partition mit Offset mounten."
+            echo "::error::Konnte keine Partition mit DTB-Inhalten finden."
+            sudo losetup -d "$LOOP_DEV" || true
             exit 1
           fi
-          
+
           echo "Kopiere alle .dtb und .dtsi Dateien..."
-          find boot_mnt -type f \( -name "*.dtb" -o -name "*.dtsi" \) -exec cp {} dtb_output/ \; 2>/dev/null || true
-          
+          find boot_mnt -type f \( -iname "*.dtb" -o -iname "*.dtsi" \) -exec cp {} dtb_output/ \; 2>/dev/null || true
+
           if [ -f "boot_mnt/dtb.img" ]; then
             echo "Aktive dtb.img gefunden!"
             cp boot_mnt/dtb.img dtb_output/active_rg43v_pro.dtb
           fi
-          
+
           echo "Inhalt des Ausgabeordners:"
           ls -la dtb_output/
-          
-          sudo umount boot_mnt || true
+
+          sudo umount boot_mnt || sudo umount -l boot_mnt || true
+          sudo losetup -d "$LOOP_DEV" || true
 
       - name: DTB zu DTS dekompilieren
         run: |
           mkdir -p dts_output
           FOUND_DTB=false
-          
+
           for dtb in dtb_output/*.dtb; do
-            if [ -f "$dtb" ]; then
-              FOUND_DTB=true
-              filename=$(basename -- "$dtb")
-              name="${filename%.*}"
-              echo "Dekompiliere $filename zu DTS..."
-              dtc -I dtb -O dts -o "dts_output/${name}.dts" "$dtb" || echo "Warnung: Fehler beim Dekompilieren von $dtb"
+            [ -f "$dtb" ] || continue
+            FOUND_DTB=true
+            filename=$(basename -- "$dtb")
+            name="${filename%.*}"
+            echo "Dekompiliere $filename zu DTS..."
+            # -@ erhält Phandle-/Symbol-Referenzen (wichtig für Overlays/Fixups
+            # auf Amlogic/Rockchip-Boards). Fehlerausgabe wird mitgeloggt statt
+            # nur "Warnung" ohne Details zu schreiben.
+            if ! dtc -@ -I dtb -O dts -o "dts_output/${name}.dts" "$dtb" 2> "dts_output/${name}.decompile.log"; then
+              echo "::warning::Fehler beim Dekompilieren von $dtb, siehe ${name}.decompile.log"
             fi
           done
-          
+
           if [ "$FOUND_DTB" = false ]; then
-            echo "Warnung: Keine .dtb Dateien zum Dekompilieren gefunden!"
+            echo "::error::Keine .dtb Dateien zum Dekompilieren gefunden!"
+            exit 1
           fi
+
+      - name: GPIO / Pinctrl / Input-Belegung zusammenfassen
+        run: |
+          mkdir -p gpio_summary
+          for dts in dts_output/*.dts; do
+            [ -f "$dts" ] || continue
+            name=$(basename -- "$dts" .dts)
+            out="gpio_summary/${name}_gpio_summary.txt"
+            {
+              echo "=== GPIO/Pinctrl/Input-Zusammenfassung: $name ==="
+              echo ""
+              echo "--- gpio-keys / adc-keys (Buttons) ---"
+              awk '/gpio-keys|adc-keys/{f=1} f{print} /};/{if(f){f=0; print "---"}}' "$dts" 2>/dev/null
+
+              echo ""
+              echo "--- pinctrl-Knoten ---"
+              grep -n "pinctrl" "$dts" 2>/dev/null
+
+              echo ""
+              echo "--- GPIO-Referenzen (<&gpioX ...>) ---"
+              grep -noE "&gpio[a-z0-9_]*[^;]*" "$dts" 2>/dev/null
+
+              echo ""
+              echo "--- Regulatoren (vdd/vcc, für Spannungsversorgung wichtig) ---"
+              grep -noE "regulator-name = \"[^\"]*\"" "$dts" 2>/dev/null
+
+              echo ""
+              echo "--- Display / Backlight ---"
+              grep -n "backlight\|panel\|lcd\|display" "$dts" 2>/dev/null
+
+              echo ""
+              echo "--- Audio ---"
+              grep -n "audio\|codec\|i2s\|es8316\|es8388" "$dts" 2>/dev/null
+
+              echo ""
+              echo "--- WiFi / SDIO / Bluetooth ---"
+              grep -n "sdio\|wifi\|bluetooth\|bt_" "$dts" 2>/dev/null
+            } > "$out"
+            echo "Zusammenfassung geschrieben: $out"
+          done
 
       - name: Ergebnisse als Artifact hochladen
         uses: actions/upload-artifact@v4
@@ -164,4 +261,7 @@ jobs:
           name: rg43v-pro-dts-analysis
           path: |
             dtb_output/
-            dts_output/ 
+            dts_output/
+            gpio_summary/
+          if-no-files-found: warn
+ 
