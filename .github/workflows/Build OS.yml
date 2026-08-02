@@ -14,19 +14,32 @@ jobs:
       - name: System-Abhängigkeiten installieren
         run: |
           sudo apt-get update
-          sudo apt-get install -y wget curl p7zip-full p7zip-rar xz-utils kpartx device-tree-compiler python3-pip util-linux
+          sudo apt-get install -y wget curl p7zip-full p7zip-rar xz-utils util-linux device-tree-compiler python3-pip fdisk
           pip3 install --upgrade pip
-          pip3 install gdown
+          pip3 install gdown requests
 
-      - name: Firmware von Google Drive herunterladen
+      - name: Firmware von Google Drive herunterladen (Robuster Download)
         run: |
           echo "Lade EmuELEC Firmware für RG43V-Pro herunter..."
-          gdown --fuzzy "https://drive.google.com/file/d/1h7hc3wwdCgFMogr7Fi-W8EeQwp279Ipm/view?usp=sharing" -O firmware_archive
+          FILE_ID="1h7hc3wwdCgFMogr7Fi-W8EeQwp279Ipm"
           
+          # Versuch 1 mit gdown fuzzy
+          gdown --fuzzy --id "$FILE_ID" -O firmware_archive || true
+          
+          # Versuch 2 falls gdown das Limit erreicht hat oder fehlschlägt
           if [ ! -f "firmware_archive" ] || [ ! -s "firmware_archive" ]; then
-            echo "Fehler: Download fehlgeschlagen oder Datei ist leer!"
+            echo "Versuche alternativen Google Drive Direkt-Download..."
+            CONFIRM=$(wget --save-cookies cookies.txt --keep-session-cookies --no-check-certificate -qO- "https://docs.google.com/uc?export=download&id=$FILE_ID" | grep -o 'confirm=[^&]*' | head -n 1)
+            wget --load-cookies cookies.txt "https://docs.google.com/uc?export=download&confirm=$CONFIRM&id=$FILE_ID" -O firmware_archive || true
+          fi
+          
+          # Prüfung ob Datei erfolgreich da ist
+          if [ ! -f "firmware_archive" ] || [ ! -s "firmware_archive" ]; then
+            echo "Fehler: Download der Firmware endgültig fehlgeschlagen!"
             exit 1
           fi
+          echo "Firmware erfolgreich heruntergeladen. Dateigröße:"
+          ls -lh firmware_archive
 
       - name: Image-Datei entpacken
         run: |
@@ -51,59 +64,61 @@ jobs:
           echo "Gefundenes Image: $IMG_FILE"
           echo "IMG_FILE=$IMG_FILE" >> $GITHUB_ENV
 
-      - name: Image mounten und DTB/DTSI extrahieren
+      - name: Partitionen analysieren und per Offset mounten
         run: |
           mkdir -p dtb_output
           mkdir -p boot_mnt
           
           IMG="${{ env.IMG_FILE }}"
-          echo "Verwende Image: $IMG"
+          echo "Analysiere Partitionstabelle von: $IMG"
           
-          # Loop-Device zuweisen
-          LOOP_DEV=$(sudo losetup --find --show --partscan "$IMG")
-          echo "Loop-Device erstellt: $LOOP_DEV"
-          
-          # Partitionen ermitteln
-          PARTITIONS=$(ls ${LOOP_DEV}p* 2>/dev/null || true)
-          if [ -z "$PARTITIONS" ]; then
-            # Fallback falls partscan nicht sofort greift
-            sudo kpartx -av "$IMG"
-            sleep 2
-            LOOP_NAME=$(basename "$LOOP_DEV")
-            PARTITIONS=$(ls /dev/mapper/${LOOP_NAME}p* 2>/dev/null || true)
-          fi
-          
-          echo "Gefundene Partitionen: $PARTITIONS"
+          fdisk -l "$IMG"
           
           MOUNTED=false
-          for part in $PARTITIONS; do
-            echo "Versuche Partition zu mounten: $part"
-            if sudo mount "$part" boot_mnt 2>/dev/null; then
-              echo "Erfolgreich gemountet: $part"
-              # Prüfen ob DTB-Inhalte vorhanden sind
-              if find boot_mnt -name "*.dtb" -o -name "dtb.img" -o -name "*.dtsi" | grep -q .; then
-                echo "Boot-Partition erfolgreich identifiziert!"
-                MOUNTED=true
-                break
-              else
-                echo "Keine DTB-Dateien in diesem Pfad, unmounten..."
-                sudo umount boot_mnt || true
+          
+          # Automatisches Auslesen der Startsektoren über fdisk
+          while read -r start_sect; do
+            if [[ "$start_sect" =~ ^[0-9]+$ ]]; then
+              OFFSET=$((start_sect * 512))
+              echo "Teste Partition mit Startsektor $start_sect (Offset: $OFFSET Bytes)..."
+              
+              if sudo mount -o loop,offset=$OFFSET "$IMG" boot_mnt 2>/dev/null; then
+                echo "Erfolgreich gemountet mit Offset $OFFSET!"
+                
+                if find boot_mnt -name "*.dtb" -o -name "dtb.img" -o -name "*.dtsi" | grep -q .; then
+                  echo "Boot-Partition anhand von DTB-Inhalten identifiziert!"
+                  MOUNTED=true
+                  break
+                else
+                  echo "Keine DTB-Inhalte in diesem Offset, unmounten..."
+                  sudo umount boot_mnt || true
+                fi
               fi
             fi
-          done
+          done <<EOF
+          $(fdisk -l "$IMG" | awk 'NR>7 {print $2}')
+          EOF
           
-          # Falls keine Partition spezifisch erkannt wurde, erzwinge das Mounten der ersten Partition
+          # Fallback für feste Standard-Offsets bei eMMC-Images
           if [ "$MOUNTED" = false ]; then
-            FIRST_PART=$(echo $PARTITIONS | awk '{print $1}')
-            if [ -n "$FIRST_PART" ]; then
-              echo "Fallback: Versuche erzwingen des Mountens von $FIRST_PART"
-              sudo mount "$FIRST_PART" boot_mnt && MOUNTED=true || true
-            fi
+            echo "Automatischer Offset fehlgeschlagen, teste bekannte Standard-Offsets..."
+            for sect in 16384 32768 8192 2048 65536 1024; do
+              OFFSET=$((sect * 512))
+              echo "Teste festen Offset: $OFFSET Bytes..."
+              if sudo mount -o loop,offset=$OFFSET "$IMG" boot_mnt 2>/dev/null; then
+                if find boot_mnt -name "*.dtb" -o -name "dtb.img" -o -name "*.dtsi" | grep -q .; then
+                  echo "Boot-Partition mit festem Offset $OFFSET gefunden!"
+                  MOUNTED=true
+                  break
+                else
+                  sudo umount boot_mnt || true
+                fi
+              fi
+            done
           fi
           
           if [ "$MOUNTED" = false ]; then
-            echo "Fehler: Konnte keine Boot-Partition mounten."
-            sudo losetup -d "$LOOP_DEV" || true
+            echo "Fehler: Konnte keine Partition mit Offset mounten."
             exit 1
           fi
           
@@ -118,10 +133,7 @@ jobs:
           echo "Inhalt des Ausgabeordners:"
           ls -la dtb_output/
           
-          # Aufräumen
           sudo umount boot_mnt || true
-          sudo losetup -d "$LOOP_DEV" || true
-          sudo kpartx -d "$IMG" 2>/dev/null || true
 
       - name: DTB zu DTS dekompilieren
         run: |
